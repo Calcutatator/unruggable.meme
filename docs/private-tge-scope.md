@@ -176,7 +176,11 @@ packages/contracts/src/
 
 ## Test plan
 
-Targeting ≥ 30 unit tests across:
+**Result: 40 new unit tests added, all passing. Baseline 78 unit tests still passing — no regressions.**
+
+The 18 pre-existing fork-test failures are unrelated: the repo's pinned `Scarb.toml` points at `https://rpc.nethermind.io/mainnet-juno/` which Nethermind has sunset, so the fork tests cannot reach a live RPC. This affects the `unruggable::tests::fork_tests::*` suite both before and after this PR.
+
+Tests split across three new files:
 
 **`test_shielded_pool.cairo`** (mock pool sanity):
 - `register_token` / `is_token_registered`
