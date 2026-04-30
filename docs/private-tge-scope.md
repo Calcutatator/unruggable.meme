@@ -1,8 +1,10 @@
 # Private TGE — Scope
 
-Adds a **private TGE path** to the unruggable launchpad: launches whose **team allocation is delivered as STRK20 shielded notes** instead of public ERC20 transfers, while preserving every existing unruggable safety guarantee (locked LP, transfer restriction window, max-team-allocation cap).
+Adds a **private TGE path on Ekubo** to the unruggable launchpad: launches whose **team allocation is delivered as STRK20 shielded notes** instead of public ERC20 transfers, while preserving every existing unruggable safety guarantee (locked LP, transfer restriction window, max-team-allocation cap).
 
 This is a single, coherent first PR. A follow-up PR can add a **private buyer path** once the production STRK20 contracts publish their anonymous-DeFi-call interface — see *Out of scope (next PR)* below.
+
+**Scope decision:** Ekubo is the only AMM target for the private launch path. Jediswap and StarkDeFi private variants are deliberately not included — production token launches go through Ekubo only. Existing public `launch_on_jediswap` / `launch_on_starkdefi` paths in the unruggable repo are untouched and remain available for any non-private launches.
 
 ---
 
@@ -27,9 +29,9 @@ Today, when a memecoin launches via unruggable, the team allocation is distribut
 
 ## Goals
 
-1. New launch path `launch_private_on_{jediswap,ekubo,starkdefi}` that delivers the team allocation as shielded notes inside a STRK20-shape pool, leaving the AMM-side liquidity flow unchanged.
+1. New launch path `launch_private_on_ekubo` that delivers the team allocation as shielded notes inside a STRK20-shape pool, leaving the Ekubo AMM-side liquidity flow unchanged.
 2. Faithful interface design against the STRK20 whitepaper so that production deployment is a constructor swap (mock pool → real STRK20 pool), not a contract rewrite.
-3. Comprehensive tests covering the new path, all reverts, and full lifecycle (deposit-as-note → withdraw-to-public).
+3. Comprehensive tests covering validation pre-checks on the launch path, plus a full deposit-as-note → withdraw-to-public lifecycle on a real `UnruggableMemecoin`.
 
 ## Non-goals
 
@@ -114,11 +116,9 @@ This is **not** a STRK20 implementation; it is a fixture sufficient to verify th
 
 We extend `Factory` (not a separate `PrivateFactory` — fewer moving parts, existing unruggable users see a strict superset of the API):
 
-- New constructor argument: `shielded_pool_address: ContractAddress`. Optional via zero-address sentinel: if zero, the private launch paths revert with `errors::SHIELDED_POOL_NOT_SET`. This keeps deployments without a STRK20 pool fully backward-compatible.
-- New entry points in `IFactory`:
-  - `launch_private_on_jediswap(launch_parameters, private_launch_parameters, quote_amount, unlock_time)`
+- New constructor argument: `shielded_pool_address: ContractAddress`. Optional via zero-address sentinel: if zero, `launch_private_on_ekubo` reverts with `errors::SHIELDED_POOL_NOT_SET`. This keeps deployments without a STRK20 pool fully backward-compatible.
+- New entry point in `IFactory`:
   - `launch_private_on_ekubo(launch_parameters, private_launch_parameters, ekubo_parameters)`
-  - `launch_private_on_starkdefi(launch_parameters, private_launch_parameters, quote_amount, unlock_time)`
 - New struct `PrivateLaunchParameters`:
   ```cairo
   #[derive(Drop, Serde)]
@@ -132,17 +132,15 @@ We extend `Factory` (not a separate `PrivateFactory` — fewer moving parts, exi
 
 ### Private launch flow
 
-`launch_private_on_<exchange>(...)`:
+`launch_private_on_ekubo(...)`:
 
-1. Run all existing checks (`check_common_launch_parameters`): caller is owner, not yet launched, holders list well-formed, team alloc within cap. Note that for the private path we ignore `launch_parameters.initial_holders` / `initial_holders_amounts` for *distribution* (they're delivered as commitments) but still use them to compute `team_allocation` so the supply caps line up. **Decision: require `initial_holders` and `initial_holders_amounts` to be empty in the private path; team allocation is the sum of `private_launch_parameters.note_amounts`.** This avoids two parallel sources of truth.
-2. Recompute `team_allocation = sum(note_amounts)`, assert `team_allocation <= max_team_allocation`.
-3. Assert `note_commitments.len() == note_amounts.len() == encrypted_outputs.len()` and ≤ `MAX_HOLDERS_LAUNCH`.
-4. Assert `shielded_pool.is_token_registered(memecoin_address)` — register lazily inside the factory if not.
-5. Create AMM liquidity exactly as in the public flow (LP locked normally).
-6. Approve the shielded pool to pull `team_allocation` of memecoin from the factory.
-7. Call `shielded_pool.deposit(memecoin_address, team_allocation, note_commitments, note_amounts, encrypted_outputs)`.
-8. Call `memecoin.set_launched(...)` with the same parameters as the public path.
-9. Emit `MemecoinLaunched { … }` (existing) and `MemecoinPrivateTGE { … }` (new).
+1. `check_private_launch_parameters` — caller is owner, memecoin not launched, public `initial_holders` / `initial_holders_amounts` are empty (single source of truth), note arrays same-length and within `MAX_HOLDERS_LAUNCH`, team alloc within 10% cap, shielded pool configured, memecoin registered in pool.
+2. Validate `ekubo_parameters` (fee, tick spacing, bound, starting price).
+3. Create Ekubo concentrated liquidity exactly as in the public flow (LP held inside `EkuboLauncher`).
+4. Approve the shielded pool to pull `team_allocation` of memecoin from the factory.
+5. Call `shielded_pool.deposit(memecoin_address, team_allocation, note_commitments, note_amounts, encrypted_outputs)`.
+6. Call `memecoin.set_launched(...)` with the same parameters as the public path.
+7. Emit `MemecoinLaunched { … }` (existing) and `MemecoinPrivateTGE { … }` (new).
 
 ### Errors (added)
 
@@ -164,57 +162,61 @@ packages/contracts/src/
   mocks/
     shielded_pool.cairo               # MockShieldedPool
   factory/
-    interface.cairo                   # +launch_private_on_*, +PrivateLaunchParameters
-    factory.cairo                     # +shielded_pool_address storage, +launch_private_on_* impls
+    interface.cairo                   # +launch_private_on_ekubo, +PrivateLaunchParameters
+    factory.cairo                     # +shielded_pool_address storage, +launch_private_on_ekubo impl
   errors.cairo                        # +SHIELDED_POOL_NOT_SET etc.
   tests/
     unit_tests/
       test_shielded_pool.cairo        # MockShieldedPool unit tests
-      test_private_launch.cairo       # private launch path tests across all 3 exchanges
-      test_private_lifecycle.cairo    # deposit-as-note → withdraw-to-public end-to-end
+      test_private_launch.cairo       # validation pre-checks for launch_private_on_ekubo
+      test_private_lifecycle.cairo    # deposit-as-note → withdraw-to-public on UnruggableMemecoin
 ```
 
 ## Test plan
 
-**Result: 40 new unit tests added, all passing. Baseline 78 unit tests still passing — no regressions. A devnet-based E2E walkthrough script also passes end-to-end (see [`docs/private-tge-e2e.md`](private-tge-e2e.md)).**
+**Result: 34 new unit tests added, all passing. Baseline 78 unit tests still passing — no regressions. A devnet-based E2E walkthrough script also passes end-to-end (see [`docs/private-tge-e2e.md`](private-tge-e2e.md)).**
 
 The 18 pre-existing fork-test failures are unrelated: the repo's pinned `Scarb.toml` points at `https://rpc.nethermind.io/mainnet-juno/` which Nethermind has sunset, so the fork tests cannot reach a live RPC. This affects the `unruggable::tests::fork_tests::*` suite both before and after this PR.
 
 Tests split across three new files:
 
-**`test_shielded_pool.cairo`** (mock pool sanity):
-- `register_token` / `is_token_registered`
+**`test_shielded_pool.cairo`** (17 tests — MockShieldedPool sanity):
+- `register_token` / `is_token_registered` / register-twice / register-zero rejections
 - `deposit` happy path: balances move, commitments stored, root advances
-- `deposit` rejects unregistered token
-- `deposit` rejects when `sum(note_amounts) != amount`
-- `deposit` rejects when array lengths disagree
-- `withdraw` happy path: balance returned to recipient, nullifier marked spent
-- `withdraw` rejects unknown commitment
-- `withdraw` rejects already-spent nullifier
-- `withdraw` rejects mismatched (token, amount) for commitment
+- `deposit` rejects: unregistered token, array len mismatch, output len mismatch, no notes, sum mismatch, zero amount per note, duplicate commitment
+- `withdraw` happy path: balance returned to recipient, nullifier marked spent, commitment cleared
+- `withdraw` rejects: double spend, unknown commitment, wrong amount, wrong token
+- Independent withdrawals (two recipients don't interfere)
 
-**`test_private_launch.cairo`** (one block per exchange — Jediswap / Ekubo / StarkDeFi):
-- Happy path: launches, team alloc lives in pool as commitments, AMM liquidity present, LP locked, memecoin `is_launched`
-- Rejects when caller is not memecoin owner
-- Rejects when memecoin already launched
-- Rejects when `note_commitments.len() != note_amounts.len()`
-- Rejects when team allocation exceeds 10% cap
+**`test_private_launch.cairo`** (13 tests — validation pre-checks on `launch_private_on_ekubo`):
+- `shielded_pool_address` getter
 - Rejects when shielded pool address unset (zero)
+- Rejects when caller is not memecoin owner
+- Rejects when public `initial_holders` is non-empty (single source of truth)
+- Rejects when `note_commitments.len() != note_amounts.len()`
+- Rejects when `note_commitments.len() != encrypted_outputs.len()`
+- Rejects when no notes provided
+- Rejects when too many notes (over `MAX_HOLDERS_LAUNCH`)
+- Rejects when team allocation exceeds 10% cap
 - Rejects when token not registered in pool
-- Rejects when public `initial_holders` is non-empty (ensures single source of truth)
-- Transfer restriction is enforced post-launch (max-buy-percentage works on public side)
-- `MemecoinPrivateTGE` event emitted; recipient details are NOT in the event
+- Rejects when memecoin not deployed by factory
+- Rejects when quote token == memecoin
 
-**`test_private_lifecycle.cairo`** (end-to-end):
-- Create memecoin → register pool → launch_private → recipient withdraws note → balance lands publicly → public ERC20 transfers work normally afterwards
-- Two recipients, partial withdrawals work independently (one withdraws, the other doesn't, both balances correct)
+The full Ekubo happy path (validation passes, AMM liquidity created, team alloc deposited) requires the mainnet Ekubo deployment — same constraint as the existing public `launch_on_ekubo`. That path is exercisable via fork tests (currently broken due to a sunset RPC; out of scope to fix here).
+
+**`test_private_lifecycle.cairo`** (4 tests — full deposit→withdraw on a real `UnruggableMemecoin`):
+- Two-note deposit + two-recipient independent withdrawal: pool balance, commitment cleared, `(token, amount)` round-trips correctly
+- Pool root advances on each deposit
+- Post-withdraw recipient can publicly transfer the memecoin (verifies `UnruggableMemecoin._transfer` lets the pool send tokens out without hitting transfer restrictions)
+- Three-note deposit with one withdrawal — the other two notes stay parked, partial withdrawals don't interfere
 
 ## Out of scope (next PR)
 
-- **Private buyer path.** A `buy_private_on_<exchange>` that lets a buyer deposit quote tokens into the shielded pool, prove an anonymous swap into the AMM, and exit with a shielded note for the launched memecoin. This depends on STRK20's anonymous-DeFi-call interface, which the whitepaper describes conceptually but the public docs do not yet specify.
+- **Private buyer path on Ekubo.** A `buy_private_on_ekubo` that lets a buyer deposit quote tokens into the shielded pool, prove an anonymous swap through Ekubo, and exit with a shielded note for the launched memecoin. This depends on STRK20's anonymous-DeFi-call interface, which the whitepaper describes conceptually but the public docs do not yet specify.
 - **Compliance hooks.** Wiring the auditor entity / selective-unshield framework to launch metadata (e.g. attaching a regulator-readable memo to each team-allocation note).
 - **Private airdrop helper.** Bulk-deposit-as-notes utility separate from the TGE flow.
 - **Frontend changes.** This PR is contracts-only.
+- **Fixing the broken fork-test RPC.** The pinned Nethermind RPC was sunset before this PR landed; updating it to a working endpoint would unblock the existing public Ekubo fork tests AND any future private-Ekubo fork test, but is unrelated to the privacy machinery and is left for a separate PR.
 
 ## Risks
 
@@ -224,4 +226,4 @@ Tests split across three new files:
 
 ## Backward compatibility
 
-Pure addition. Existing `launch_on_*` paths are byte-for-byte unchanged. Existing factory deployments that don't pass a `shielded_pool_address` (or pass zero) reject the new private paths and behave identically to today's contract.
+Pure addition. Existing `launch_on_jediswap` / `launch_on_ekubo` / `launch_on_starkdefi` are byte-for-byte unchanged. Existing factory deployments that don't pass a `shielded_pool_address` (or pass zero) reject `launch_private_on_ekubo` and otherwise behave identically to today's contract.

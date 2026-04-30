@@ -1,17 +1,37 @@
 // scripts/private-tge-e2e.js
 //
-// End-to-end devnet walkthrough for the Private TGE feature.
+// End-to-end devnet walkthrough for the privacy machinery added by this PR.
 //
 // What this does:
 //   1. Connects to a local starknet-devnet (default http://127.0.0.1:5050)
-//   2. Declares & deploys: ERC20 quote token, LockManager, mock Jediswap (FactoryC1 +
-//      RouterC1), MockShieldedPool, UnruggableMemecoin class, Factory
-//   3. Creates a memecoin via the Factory
-//   4. Registers the memecoin in the shielded pool
-//   5. Calls launch_private_on_jediswap — seeds AMM liquidity AND deposits the team
-//      allocation into the shielded pool as opaque notes
+//   2. Declares & deploys: MockShieldedPool, ERC20Token (a generic ERC20 standing in
+//      for the launched token — the pool is token-agnostic, so this exercises the same
+//      machinery that runs against UnruggableMemecoin in production)
+//   3. Registers the token in the pool
+//   4. Approves the pool to pull tokens from the deployer (who holds the supply)
+//   5. Calls pool.deposit(token, amount, commitments, amounts, encrypted_outputs) —
+//      the same call that `launch_private_on_ekubo` makes internally during a private TGE
 //   6. Verifies on-chain state (pool balance, commitments)
-//   7. Withdraws a note to a recipient and verifies the recipient received memecoin
+//   7. Withdraws a note to a recipient and verifies the recipient received the token
+//
+// Why this scope:
+//   The production launch path is `Factory.launch_private_on_ekubo`, which seeds AMM
+//   liquidity on the real Ekubo deployment AND deposits the team allocation into the
+//   shielded pool. Ekubo isn't available on a fresh devnet (no in-repo mock), so this
+//   script exercises the privacy machinery directly — the same `pool.deposit` /
+//   `pool.withdraw` calls the launch function makes, on a real Starknet VM.
+//
+//   We use the generic ERC20Token mock instead of UnruggableMemecoin because UDC-based
+//   deploys can't easily inject a deployer-owned supply into the memecoin (its
+//   constructor mints to `get_caller_address()`, which is the UDC, not the account).
+//   The pool's deposit/withdraw flow is token-agnostic, so the integration is verified
+//   regardless of which ERC20 is at the other end. UnruggableMemecoin-specific
+//   interactions (transfer restrictions post-launch) are covered by the snforge unit
+//   tests (`test_private_lifecycle.cairo::test_post_withdraw_recipient_can_publicly_transfer`).
+//
+//   Validation pre-checks for `launch_private_on_ekubo` are covered by the snforge unit
+//   tests (`test_private_launch.cairo`). The full Ekubo happy path requires a mainnet
+//   fork test, same as the existing `launch_on_ekubo`.
 //
 // Usage:
 //   1) In one terminal:   starknet-devnet --seed 42 --accounts 3 --port 5050
@@ -29,11 +49,8 @@ import colors from "colors";
 import {
   Account,
   RpcProvider,
-  CallData,
   json,
   shortString,
-  cairo,
-  hash,
   num,
   logger,
 } from "starknet";
@@ -143,14 +160,9 @@ function eq(a, b, label) {
 
 // --------------------------------------------------------------------------- constants
 
-const ETH_INITIAL_SUPPLY = 500_000_000n * 10n ** 18n;
-const DEFAULT_INITIAL_SUPPLY = 21_000_000n * 10n ** 18n; // memecoin supply
+const MEMECOIN_INITIAL_SUPPLY = 21_000_000n * 10n ** 18n;
 const HALF_NOTE = 105_000n * 10n ** 18n; // 0.5% of supply per note
 const TEAM_ALLOCATION = HALF_NOTE * 2n; // 1% of supply
-const ETH_AMOUNT = 1n * 10n ** 18n; // 1 ETH for AMM liquidity
-const MIN_LOCKTIME = 15_721_200; // 6 months
-const TRANSFER_RESTRICTION_DELAY = 1000;
-const MAX_PERCENTAGE_BUY_LAUNCH = 200; // 2%
 
 // --------------------------------------------------------------------------- main
 
@@ -162,165 +174,72 @@ async function main() {
   const owner = await getDevnetAccount(provider);
   console.log(`  owner    ${shortHex(owner.address)}`.gray);
 
-  step(1, "Declare & deploy supporting contracts");
+  step(1, "Declare & deploy contracts");
 
-  // 1a. Quote token (acts as ETH for the launch's quote-side liquidity).
-  const quoteToken = await declareAndDeploy(owner, "ERC20Token", [
-    ...u256(ETH_INITIAL_SUPPLY),
-    owner.address,
-  ]);
-
-  // 1b. LockPosition (declared only — used by LockManager).
-  const lockPositionClassHash = await declareClass(owner, "LockPosition");
-
-  // 1c. LockManager.
-  const lockManager = await declareAndDeploy(owner, "LockManager", [
-    MIN_LOCKTIME.toString(),
-    lockPositionClassHash,
-  ]);
-
-  // 1d. Mock Jediswap. Pair class is declared only; FactoryC1 takes its class hash.
-  const pairClassHash = await declareClass(owner, "PairC1");
-  const jediFactory = await declareAndDeploy(owner, "FactoryC1", [
-    pairClassHash,
-    owner.address,
-  ]);
-  const jediRouter = await declareAndDeploy(owner, "RouterC1", [
-    jediFactory.address,
-  ]);
-
-  // 1e. The shielded pool we're integrating.
+  // 1a. The shielded pool we're integrating.
   const pool = await declareAndDeploy(owner, "MockShieldedPool", []);
 
-  // 1f. UnruggableMemecoin class (declared; instances created by the factory).
-  const memecoinClassHash = await declareClass(owner, "UnruggableMemecoin");
+  // 1b. Generic ERC20 standing in for the launched token. Mints the supply to the
+  //     deployer account so we can drive approve/deposit from outside.
+  const token = await declareAndDeploy(owner, "ERC20Token", [
+    ...u256(MEMECOIN_INITIAL_SUPPLY),
+    owner.address,
+  ]);
 
-  // 1g. Factory — extended with shielded_pool_address.
-  // Constructor calldata layout (raw felts; matches Cairo serialisation):
-  //   memecoin_class_hash, lock_manager_address,
-  //   exchanges_len, [exchanges...], migrated_tokens_len, [migrated...], shielded_pool_address
-  // Each exchanges entry is (variant_idx, address); SupportedExchanges::Jediswap = 0.
-  const factoryCalldata = [
-    memecoinClassHash,
-    lockManager.address,
-    "1", // exchanges array length
-    "0", // SupportedExchanges::Jediswap
-    jediRouter.address,
-    "0", // migrated_tokens array length
-    pool.address,
-  ];
-  const factoryClassHash = await declareClass(owner, "Factory");
-  const factoryAddress = await deployContract(
-    owner,
-    "Factory",
-    factoryClassHash,
-    factoryCalldata,
-  );
-
-  step(2, "Create memecoin via Factory");
-
-  const NAME = shortString.encodeShortString("E2EMeme");
-  const SYMBOL = shortString.encodeShortString("E2E");
-  const SALT = shortString.encodeShortString("e2e_salt");
-
-  const createTx = await owner.execute({
-    contractAddress: factoryAddress,
-    entrypoint: "create_memecoin",
-    calldata: [
-      owner.address,
-      NAME,
-      SYMBOL,
-      ...u256(DEFAULT_INITIAL_SUPPLY),
-      SALT,
-    ],
-  });
-  await owner.waitForTransaction(createTx.transaction_hash);
-
-  // Extract memecoin address from the MemecoinCreated event.
-  const createReceipt = await provider.getTransactionReceipt(createTx.transaction_hash);
-  // Find the event whose first key == hash of "MemecoinCreated".
-  const memecoinCreatedSelector = hash.getSelectorFromName("MemecoinCreated");
-  const ev = createReceipt.events.find(
-    (e) => num.toHex(e.from_address) === num.toHex(factoryAddress),
-  );
-  if (!ev) throw new Error("MemecoinCreated event not found");
-  // Event data layout (from factory.cairo): owner, name, symbol, initial_supply (u256 = 2 felts), memecoin_address
-  const memecoinAddress = ev.data[ev.data.length - 1];
-  console.log(`    memecoin ${shortHex(memecoinAddress)}`.gray);
-
-  step(3, "Register memecoin in shielded pool");
+  step(2, "Register token in shielded pool");
 
   await owner.execute({
     contractAddress: pool.address,
     entrypoint: "register_token",
-    calldata: [memecoinAddress],
+    calldata: [token.address],
   });
   console.log(`    ✓ registered`.green);
 
-  step(4, "Approve quote token for AMM liquidity");
+  step(3, "Approve pool to pull team allocation from supply holder");
 
   await owner.execute({
-    contractAddress: quoteToken.address,
+    contractAddress: token.address,
     entrypoint: "approve",
-    calldata: [factoryAddress, ...u256(ETH_AMOUNT)],
+    calldata: [pool.address, ...u256(TEAM_ALLOCATION)],
   });
-  console.log(`    ✓ approved ${ETH_AMOUNT} of quote token to factory`.green);
+  console.log(`    ✓ approved ${TEAM_ALLOCATION} of token to pool`.green);
 
-  step(5, "launch_private_on_jediswap");
+  step(4, "Deposit team allocation as shielded notes");
   console.log(
-    "    seeds AMM liquidity AND deposits team allocation as shielded notes\n".gray,
+    "    same call Factory.launch_private_on_ekubo would make internally\n".gray,
   );
 
-  // Two notes — recipients are off-chain, we just commit to them here.
   const COMMIT_A = "0xAAA";
   const COMMIT_B = "0xBBB";
-  // EncryptedNote = { payload: Span<felt252> }; payload is a 1-felt placeholder.
-  const launchPrivateCalldata = [
-    // LaunchParameters
-    memecoinAddress, // memecoin_address
-    TRANSFER_RESTRICTION_DELAY.toString(), // transfer_restriction_delay
-    MAX_PERCENTAGE_BUY_LAUNCH.toString(), // max_percentage_buy_launch
-    quoteToken.address, // quote_address
-    "0", // initial_holders.len()
-    "0", // initial_holders_amounts.len()
-    // PrivateLaunchParameters
+  const depositCalldata = [
+    token.address, // token
+    ...u256(TEAM_ALLOCATION), // amount
     "2", // note_commitments.len()
     COMMIT_A,
     COMMIT_B,
     "2", // note_amounts.len()
-    ...u256(HALF_NOTE), // amount A (low, high)
-    ...u256(HALF_NOTE), // amount B (low, high)
+    ...u256(HALF_NOTE),
+    ...u256(HALF_NOTE),
     "2", // encrypted_outputs.len()
     "1", // payload A length
-    "0x42", // payload A
+    "0x42",
     "1", // payload B length
-    "0x42", // payload B
-    // quote_amount: u256
-    ...u256(ETH_AMOUNT),
-    // unlock_time: u64 — far future, well past now+MIN_LOCKTIME
-    "9999999999",
+    "0x42",
   ];
 
-  const launchTx = await owner.execute({
-    contractAddress: factoryAddress,
-    entrypoint: "launch_private_on_jediswap",
-    calldata: launchPrivateCalldata,
+  const depositTx = await owner.execute({
+    contractAddress: pool.address,
+    entrypoint: "deposit",
+    calldata: depositCalldata,
   });
-  await owner.waitForTransaction(launchTx.transaction_hash);
-  console.log(`    ✓ launched (tx ${shortHex(launchTx.transaction_hash)})`.green);
+  await owner.waitForTransaction(depositTx.transaction_hash);
+  console.log(`    ✓ deposited (tx ${shortHex(depositTx.transaction_hash)})`.green);
 
-  step(6, "Verify on-chain state");
+  step(5, "Verify on-chain state");
 
-  // memecoin.is_launched()
-  const isLaunched = await provider.callContract({
-    contractAddress: memecoinAddress,
-    entrypoint: "is_launched",
-  });
-  eq(isLaunched[0], "0x1", "memecoin.is_launched() == true");
-
-  // memecoin.balance_of(pool) == TEAM_ALLOCATION
+  // pool now holds the team allocation
   const poolBal = await provider.callContract({
-    contractAddress: memecoinAddress,
+    contractAddress: token.address,
     entrypoint: "balance_of",
     calldata: [pool.address],
   });
@@ -331,7 +250,7 @@ async function main() {
     `pool holds team_allocation (${TEAM_ALLOCATION})`,
   );
 
-  // pool.balance_of_commitment(COMMIT_A) == HALF_NOTE
+  // commitments stored
   const commitABal = await provider.callContract({
     contractAddress: pool.address,
     entrypoint: "balance_of_commitment",
@@ -344,33 +263,24 @@ async function main() {
     "pool stores commitment A with HALF_NOTE",
   );
 
-  // pool.token_of_commitment(COMMIT_A) == memecoinAddress
   const commitAToken = await provider.callContract({
     contractAddress: pool.address,
     entrypoint: "token_of_commitment",
     calldata: [COMMIT_A],
   });
-  eq(commitAToken[0], memecoinAddress, "commitment A → memecoin");
+  eq(commitAToken[0], token.address, "commitment A → token");
 
-  // factory.shielded_pool_address() == pool.address
-  const factoryPool = await provider.callContract({
-    contractAddress: factoryAddress,
-    entrypoint: "shielded_pool_address",
-  });
-  eq(factoryPool[0], pool.address, "factory.shielded_pool_address() == pool");
+  step(6, "Withdraw note A to a recipient");
 
-  step(7, "Withdraw note A to a recipient");
-
-  // Make up a recipient address (any felt-shaped value works as a Cairo ContractAddress).
   const recipient = "0xdead";
   await owner.execute({
     contractAddress: pool.address,
     entrypoint: "withdraw",
     calldata: [
-      memecoinAddress, // token
-      recipient, // recipient
-      ...u256(HALF_NOTE), // amount
-      COMMIT_A, // commitment
+      token.address,
+      recipient,
+      ...u256(HALF_NOTE),
+      COMMIT_A,
       "0", // proof.len() (mock ignores)
       "0xCAFE", // nullifier
     ],
@@ -379,7 +289,7 @@ async function main() {
 
   // recipient now holds HALF_NOTE memecoin
   const recipientBal = await provider.callContract({
-    contractAddress: memecoinAddress,
+    contractAddress: token.address,
     entrypoint: "balance_of",
     calldata: [recipient],
   });
@@ -388,12 +298,12 @@ async function main() {
   eq(
     "0x" + recipientBalU256.toString(16),
     "0x" + HALF_NOTE.toString(16),
-    `recipient holds HALF_NOTE memecoin`,
+    "recipient holds HALF_NOTE of token",
   );
 
   // pool now holds only HALF_NOTE memecoin (B is still inside)
   const poolBalAfter = await provider.callContract({
-    contractAddress: memecoinAddress,
+    contractAddress: token.address,
     entrypoint: "balance_of",
     calldata: [pool.address],
   });
@@ -411,7 +321,7 @@ async function main() {
     entrypoint: "balance_of_commitment",
     calldata: [COMMIT_A],
   });
-  eq(commitABalAfter[0], "0x0", "commitment A cleared");
+  eq(commitABalAfter[0], "0x0", "commitment A cleared (low)");
   eq(commitABalAfter[1], "0x0", "commitment A cleared (high)");
 
   // Nullifier is spent

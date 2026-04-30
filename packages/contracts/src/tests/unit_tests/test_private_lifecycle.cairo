@@ -1,5 +1,10 @@
-//! End-to-end lifecycle tests: launch private → withdraw notes → memecoin balances on the
-//! public side behave normally afterwards.
+//! End-to-end pool integration tests.
+//!
+//! These tests exercise the full deposit-as-note → withdraw-to-public flow against a real
+//! `UnruggableMemecoin` (deployed directly, with the test address acting as the
+//! "factory_contract" that holds the supply). They verify the privacy machinery
+//! independently of the launch wrapper — which on the production path is
+//! `launch_private_on_ekubo` and requires the mainnet Ekubo deployment to drive end-to-end.
 
 use core::option::OptionTrait;
 use core::traits::TryInto;
@@ -9,16 +14,11 @@ use snforge_std::{
     TxInfoMock
 };
 use starknet::{ContractAddress, contract_address_const};
-use unruggable::factory::{
-    IFactoryDispatcher, IFactoryDispatcherTrait, LaunchParameters, PrivateLaunchParameters
-};
 use unruggable::privacy::interface::{
     EncryptedNote, IShieldedPoolDispatcher, IShieldedPoolDispatcherTrait
 };
 use unruggable::tests::unit_tests::utils::{
-    deploy_jedi_amm_factory_and_router, deploy_meme_factory_with_pool, deploy_mock_shielded_pool,
-    deploy_eth_with_owner, OWNER, NAME, SYMBOL, DEFAULT_INITIAL_SUPPLY, SALT,
-    DEFAULT_MIN_LOCKTIME, TRANSFER_RESTRICTION_DELAY, MAX_PERCENTAGE_BUY_LAUNCH, pow_256,
+    deploy_mock_shielded_pool, OWNER, NAME, SYMBOL, DEFAULT_INITIAL_SUPPLY, pow_256,
     DefaultTxInfoMock
 };
 use unruggable::token::interface::{
@@ -33,86 +33,67 @@ fn note(payload: Span<felt252>) -> EncryptedNote {
     EncryptedNote { payload }
 }
 
-fn launch_private_setup() -> (
-    IFactoryDispatcher,
-    IShieldedPoolDispatcher,
-    ContractAddress,
-    IUnruggableMemecoinDispatcher,
-    ContractAddress,
-    ERC20ABIDispatcher,
-) {
-    let owner = OWNER();
-    let (_, router_address) = deploy_jedi_amm_factory_and_router();
-    let (pool, pool_address) = deploy_mock_shielded_pool();
-    let factory_address = deploy_meme_factory_with_pool(router_address, pool_address);
-    let factory = IFactoryDispatcher { contract_address: factory_address };
-    let (eth, _) = deploy_eth_with_owner(owner);
-
-    start_prank(CheatTarget::One(factory_address), owner);
-    let memecoin_address = factory
-        .create_memecoin(
-            owner: owner,
-            name: NAME(),
-            symbol: SYMBOL(),
-            initial_supply: DEFAULT_INITIAL_SUPPLY(),
-            contract_address_salt: SALT(),
-        );
-    stop_prank(CheatTarget::One(factory_address));
-
-    pool.register_token(memecoin_address);
+/// Deploys an `UnruggableMemecoin` directly. The caller of this function becomes the
+/// memecoin's `factory_contract` and holds the entire initial supply. This is the same
+/// pattern the existing repo uses in `deploy_standalone_memecoin`.
+fn deploy_memecoin_owned_by_caller(
+    owner: ContractAddress
+) -> (IUnruggableMemecoinDispatcher, ContractAddress) {
+    let contract = declare('UnruggableMemecoin');
+    let mut calldata = array![];
+    Serde::serialize(@owner, ref calldata);
+    Serde::serialize(@NAME(), ref calldata);
+    Serde::serialize(@SYMBOL(), ref calldata);
+    Serde::serialize(@DEFAULT_INITIAL_SUPPLY(), ref calldata);
+    let address = contract.deploy(@calldata).expect('memecoin deploy failed');
 
     let mut tx_info: TxInfoMock = Default::default();
     tx_info.transaction_hash = Option::Some(1234);
-    snforge_std::start_spoof(CheatTarget::One(memecoin_address), tx_info);
+    snforge_std::start_spoof(CheatTarget::One(address), tx_info);
 
-    let memecoin = IUnruggableMemecoinDispatcher { contract_address: memecoin_address };
-    (factory, pool, pool_address, memecoin, memecoin_address, eth)
+    (IUnruggableMemecoinDispatcher { contract_address: address }, address)
 }
 
 #[test]
-fn test_lifecycle_two_recipients_withdraw_independently() {
-    let owner = OWNER();
-    let (factory, pool, pool_address, memecoin, memecoin_address, eth) = launch_private_setup();
+fn test_pool_round_trip_with_unruggable_memecoin() {
+    // Test address deploys the memecoin → test address is `factory_contract` and holds the
+    // entire supply. We then drive the pool integration that `launch_private_on_ekubo`
+    // would on production.
+    let (memecoin, memecoin_address) = deploy_memecoin_owned_by_caller(OWNER());
+    let (pool, pool_address) = deploy_mock_shielded_pool();
 
-    let eth_amount: u256 = 1 * pow_256(10, 18);
-    start_prank(CheatTarget::One(eth.contract_address), owner);
-    eth.approve(factory.contract_address, eth_amount);
-    stop_prank(CheatTarget::One(eth.contract_address));
+    // Register the memecoin in the pool.
+    pool.register_token(memecoin_address);
 
+    // Test address (the supply holder) approves the pool.
     let half: u256 = 105_000 * pow_256(10, 18);
-    let private_params = PrivateLaunchParameters {
-        note_commitments: array![0xA1, 0xB2].span(),
-        note_amounts: array![half, half].span(),
-        encrypted_outputs: array![note(one_payload()), note(one_payload())].span(),
-    };
-    let launch_params = LaunchParameters {
-        memecoin_address,
-        transfer_restriction_delay: TRANSFER_RESTRICTION_DELAY,
-        max_percentage_buy_launch: MAX_PERCENTAGE_BUY_LAUNCH,
-        quote_address: eth.contract_address,
-        initial_holders: array![].span(),
-        initial_holders_amounts: array![].span(),
-    };
+    let team_alloc: u256 = half * 2_u256;
+    memecoin.approve(pool_address, team_alloc);
 
-    start_prank(CheatTarget::One(factory.contract_address), owner);
-    start_warp(CheatTarget::One(memecoin_address), 1);
-    factory
-        .launch_private_on_jediswap(
-            launch_params, private_params, eth_amount, DEFAULT_MIN_LOCKTIME,
+    // Deposit team allocation as two notes.
+    pool
+        .deposit(
+            memecoin_address,
+            team_alloc,
+            array![0xA1, 0xB2].span(),
+            array![half, half].span(),
+            array![note(one_payload()), note(one_payload())].span(),
         );
-    stop_prank(CheatTarget::One(factory.contract_address));
-    stop_warp(CheatTarget::One(memecoin_address));
 
-    let team_alloc: u256 = half + half;
-    assert(memecoin.balance_of(pool_address) == team_alloc, 'pool team alloc');
+    assert(memecoin.balance_of(pool_address) == team_alloc, 'pool received tokens');
+    assert(pool.token_of_commitment(0xA1) == memecoin_address, 'commit A token');
+    assert(pool.balance_of_commitment(0xA1) == half, 'commit A amount');
+    assert(pool.token_of_commitment(0xB2) == memecoin_address, 'commit B token');
+    assert(pool.balance_of_commitment(0xB2) == half, 'commit B amount');
 
+    // Two recipients withdraw independently.
     let r1: ContractAddress = 'recipient_1'.try_into().unwrap();
     let r2: ContractAddress = 'recipient_2'.try_into().unwrap();
     let proof: Array<felt252> = array![];
 
     pool.withdraw(memecoin_address, r1, half, 0xA1, proof.span(), 0xCAFE);
     assert(memecoin.balance_of(r1) == half, 'r1 balance');
-    assert(memecoin.balance_of(pool_address) == half, 'pool balance after r1');
+    assert(memecoin.balance_of(pool_address) == half, 'pool half left');
     assert(pool.balance_of_commitment(0xA1) == 0, 'A1 cleared');
     assert(pool.balance_of_commitment(0xB2) == half, 'B2 still held');
 
@@ -123,92 +104,107 @@ fn test_lifecycle_two_recipients_withdraw_independently() {
 }
 
 #[test]
-fn test_lifecycle_post_withdraw_public_transfer_works() {
-    let owner = OWNER();
-    let (factory, pool, _, memecoin, memecoin_address, eth) = launch_private_setup();
+fn test_pool_round_trip_root_advances() {
+    let (memecoin, memecoin_address) = deploy_memecoin_owned_by_caller(OWNER());
+    let (pool, pool_address) = deploy_mock_shielded_pool();
 
-    let eth_amount: u256 = 1 * pow_256(10, 18);
-    start_prank(CheatTarget::One(eth.contract_address), owner);
-    eth.approve(factory.contract_address, eth_amount);
-    stop_prank(CheatTarget::One(eth.contract_address));
+    pool.register_token(memecoin_address);
+
+    let amount: u256 = 50 * pow_256(10, 18);
+    memecoin.approve(pool_address, amount * 2_u256);
+
+    let root_before = pool.current_root();
+    pool
+        .deposit(
+            memecoin_address,
+            amount,
+            array![0x9001].span(),
+            array![amount].span(),
+            array![note(one_payload())].span(),
+        );
+    let root_after_first = pool.current_root();
+    assert(root_after_first != root_before, 'root advances on first deposit');
+
+    pool
+        .deposit(
+            memecoin_address,
+            amount,
+            array![0x9002].span(),
+            array![amount].span(),
+            array![note(one_payload())].span(),
+        );
+    let root_after_second = pool.current_root();
+    assert(
+        root_after_second != root_after_first, 'root advances on second deposit'
+    );
+}
+
+#[test]
+fn test_post_withdraw_recipient_can_publicly_transfer() {
+    // After withdraw, the recipient holds the memecoin like any ERC20 holder. Public
+    // transfers work; we mirror the existing repo's transfer-restriction behaviour by
+    // not setting the memecoin "launched" — which means restrictions are disabled (see
+    // `apply_transfer_restrictions`'s early-return on `!is_launched`).
+    let (memecoin, memecoin_address) = deploy_memecoin_owned_by_caller(OWNER());
+    let (pool, pool_address) = deploy_mock_shielded_pool();
+
+    pool.register_token(memecoin_address);
 
     let alloc: u256 = 100 * pow_256(10, 18);
-    let private_params = PrivateLaunchParameters {
-        note_commitments: array![0x1234].span(),
-        note_amounts: array![alloc].span(),
-        encrypted_outputs: array![note(one_payload())].span(),
-    };
-    let launch_params = LaunchParameters {
-        memecoin_address,
-        transfer_restriction_delay: 0,
-        max_percentage_buy_launch: MAX_PERCENTAGE_BUY_LAUNCH,
-        quote_address: eth.contract_address,
-        initial_holders: array![].span(),
-        initial_holders_amounts: array![].span(),
-    };
-
-    start_prank(CheatTarget::One(factory.contract_address), owner);
-    start_warp(CheatTarget::One(memecoin_address), 1);
-    factory
-        .launch_private_on_jediswap(
-            launch_params, private_params, eth_amount, DEFAULT_MIN_LOCKTIME,
+    memecoin.approve(pool_address, alloc);
+    pool
+        .deposit(
+            memecoin_address,
+            alloc,
+            array![0x1234].span(),
+            array![alloc].span(),
+            array![note(one_payload())].span(),
         );
-    stop_prank(CheatTarget::One(factory.contract_address));
 
     let recipient: ContractAddress = 'recipient'.try_into().unwrap();
     let proof: Array<felt252> = array![];
     pool.withdraw(memecoin_address, recipient, alloc, 0x1234, proof.span(), 0xC0FFEE);
-    assert(memecoin.balance_of(recipient) == alloc, 'recipient got funds');
+    assert(memecoin.balance_of(recipient) == alloc, 'recipient received');
 
-    start_warp(CheatTarget::One(memecoin_address), 1000);
-
+    // Recipient transfers half publicly to a third party.
     let third_party: ContractAddress = 'third_party'.try_into().unwrap();
     let send_amount: u256 = 10 * pow_256(10, 18);
     start_prank(CheatTarget::One(memecoin_address), recipient);
     memecoin.transfer(third_party, send_amount);
     stop_prank(CheatTarget::One(memecoin_address));
-    stop_warp(CheatTarget::One(memecoin_address));
 
-    assert(memecoin.balance_of(third_party) == send_amount, 'third party balance');
+    assert(memecoin.balance_of(third_party) == send_amount, 'third_party received');
     assert(memecoin.balance_of(recipient) == alloc - send_amount, 'recipient minus send');
 }
 
 #[test]
-fn test_lifecycle_root_advances_on_deposit() {
-    let owner = OWNER();
-    let (factory, pool, _, _, memecoin_address, eth) = launch_private_setup();
+fn test_partial_withdrawals_when_one_recipient_does_not_claim() {
+    // Three notes; one recipient withdraws, the other two notes stay parked in the pool.
+    let (memecoin, memecoin_address) = deploy_memecoin_owned_by_caller(OWNER());
+    let (pool, pool_address) = deploy_mock_shielded_pool();
 
-    let eth_amount: u256 = 1 * pow_256(10, 18);
-    start_prank(CheatTarget::One(eth.contract_address), owner);
-    eth.approve(factory.contract_address, eth_amount);
-    stop_prank(CheatTarget::One(eth.contract_address));
+    pool.register_token(memecoin_address);
 
-    let root_before = pool.current_root();
+    let third: u256 = 30 * pow_256(10, 18);
+    let total: u256 = third * 3_u256;
+    memecoin.approve(pool_address, total);
 
-    let alloc: u256 = 50 * pow_256(10, 18);
-    let private_params = PrivateLaunchParameters {
-        note_commitments: array![0x9001, 0x9002].span(),
-        note_amounts: array![alloc, alloc].span(),
-        encrypted_outputs: array![note(one_payload()), note(one_payload())].span(),
-    };
-    let launch_params = LaunchParameters {
-        memecoin_address,
-        transfer_restriction_delay: TRANSFER_RESTRICTION_DELAY,
-        max_percentage_buy_launch: MAX_PERCENTAGE_BUY_LAUNCH,
-        quote_address: eth.contract_address,
-        initial_holders: array![].span(),
-        initial_holders_amounts: array![].span(),
-    };
-
-    start_prank(CheatTarget::One(factory.contract_address), owner);
-    start_warp(CheatTarget::One(memecoin_address), 1);
-    factory
-        .launch_private_on_jediswap(
-            launch_params, private_params, eth_amount, DEFAULT_MIN_LOCKTIME,
+    pool
+        .deposit(
+            memecoin_address,
+            total,
+            array![0x1, 0x2, 0x3].span(),
+            array![third, third, third].span(),
+            array![note(one_payload()), note(one_payload()), note(one_payload())].span(),
         );
-    stop_prank(CheatTarget::One(factory.contract_address));
-    stop_warp(CheatTarget::One(memecoin_address));
 
-    let root_after = pool.current_root();
-    assert(root_after != root_before, 'root must advance');
+    let recipient: ContractAddress = 'recipient'.try_into().unwrap();
+    let proof: Array<felt252> = array![];
+    pool.withdraw(memecoin_address, recipient, third, 0x2, proof.span(), 0xC1);
+
+    assert(memecoin.balance_of(recipient) == third, 'recipient holds third');
+    assert(memecoin.balance_of(pool_address) == third * 2_u256, 'pool holds 2/3');
+    assert(pool.balance_of_commitment(0x1) == third, 'commit 1 untouched');
+    assert(pool.balance_of_commitment(0x2) == 0, 'commit 2 cleared');
+    assert(pool.balance_of_commitment(0x3) == third, 'commit 3 untouched');
 }
