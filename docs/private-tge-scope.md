@@ -174,9 +174,9 @@ packages/contracts/src/
 
 ## Test plan
 
-**Result: 34 new unit tests added, all passing. Baseline 78 unit tests still passing — no regressions. A devnet-based E2E walkthrough script also passes end-to-end (see [`docs/private-tge-e2e.md`](private-tge-e2e.md)).**
+**Result: 130 tests pass, 0 fail, 2 ignored.** 34 new unit tests for the privacy machinery, all passing on top of the existing 78 unit tests + 18 fork tests, plus a devnet-based E2E walkthrough script that passes end-to-end (see [`docs/private-tge-e2e.md`](private-tge-e2e.md)).
 
-The 18 pre-existing fork-test failures are unrelated: the repo's pinned `Scarb.toml` points at `https://rpc.nethermind.io/mainnet-juno/` which Nethermind has sunset, so the fork tests cannot reach a live RPC. This affects the `unruggable::tests::fork_tests::*` suite both before and after this PR.
+A small but separate fix in this branch updates the fork-test RPC URL: the previously-pinned `rpc.nethermind.io/mainnet-juno` endpoint had been retired, leaving all 18 fork tests red on `main`. They now pass against Cartridge's public mainnet RPC (`api.cartridge.gg/x/starknet/mainnet`), which still serves the pinned block 519354. This is in a separate commit and can be reviewed / cherry-picked independently of the privacy work.
 
 Tests split across three new files:
 
@@ -216,7 +216,6 @@ The full Ekubo happy path (validation passes, AMM liquidity created, team alloc 
 - **Compliance hooks.** Wiring the auditor entity / selective-unshield framework to launch metadata (e.g. attaching a regulator-readable memo to each team-allocation note).
 - **Private airdrop helper.** Bulk-deposit-as-notes utility separate from the TGE flow.
 - **Frontend changes.** This PR is contracts-only.
-- **Fixing the broken fork-test RPC.** The pinned Nethermind RPC was sunset before this PR landed; updating it to a working endpoint would unblock the existing public Ekubo fork tests AND any future private-Ekubo fork test, but is unrelated to the privacy machinery and is left for a separate PR.
 
 ## Risks
 
