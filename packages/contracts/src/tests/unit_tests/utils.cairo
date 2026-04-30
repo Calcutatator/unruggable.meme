@@ -1,4 +1,5 @@
 use core::traits::TryInto;
+use core::zeroable::Zeroable;
 use openzeppelin::token::erc20::interface::{ERC20ABIDispatcher, ERC20ABIDispatcherTrait};
 use snforge_std::{
     ContractClass, ContractClassTrait, CheatTarget, declare, start_prank, stop_prank, TxInfoMock,
@@ -167,6 +168,14 @@ fn deploy_jedi_amm_factory_and_router() -> (ContractAddress, ContractAddress) {
 
 // MemeFactory
 fn deploy_meme_factory(router_address: ContractAddress) -> ContractAddress {
+    deploy_meme_factory_with_pool(router_address, Zeroable::zero())
+}
+
+/// Same as `deploy_meme_factory` but with a configured shielded pool address. Tests for the
+/// private TGE path use this; everything else stays on the zero-pool default.
+fn deploy_meme_factory_with_pool(
+    router_address: ContractAddress, shielded_pool_address: ContractAddress
+) -> ContractAddress {
     let locker_address = deploy_locker();
     let memecoin_class_hash = declare('UnruggableMemecoin').class_hash;
 
@@ -182,7 +191,21 @@ fn deploy_meme_factory(router_address: ContractAddress) -> ContractAddress {
     Serde::serialize(@locker_address, ref calldata);
     Serde::serialize(@amms.into(), ref calldata);
     Serde::serialize(@migrated_tokens, ref calldata);
+    Serde::serialize(@shielded_pool_address, ref calldata);
     contract.deploy_at(@calldata, MEMEFACTORY_ADDRESS()).expect('UnrugFactory deployment failed')
+}
+
+/// Deploys a `MockShieldedPool` and returns (dispatcher, address). Used by private TGE tests.
+fn deploy_mock_shielded_pool() -> (
+    unruggable::privacy::interface::IShieldedPoolDispatcher, ContractAddress
+) {
+    let contract = declare('MockShieldedPool');
+    let calldata = array![];
+    let address = contract.deploy(@calldata).expect('Pool deployment failed');
+    (
+        unruggable::privacy::interface::IShieldedPoolDispatcher { contract_address: address },
+        address,
+    )
 }
 
 // Locker

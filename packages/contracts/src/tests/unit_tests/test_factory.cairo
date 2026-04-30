@@ -158,10 +158,12 @@ fn test_migrate_memecoin_from_old_factory() {
     ]
         .span();
     let mut amms: Array<(SupportedExchanges, ContractAddress)> = array![];
+    let shielded_pool_address: ContractAddress = core::zeroable::Zeroable::zero();
     Serde::serialize(@memecoin_hash, ref calldata);
     Serde::serialize(@0, ref calldata);
     Serde::serialize(@amms.into(), ref calldata);
     Serde::serialize(@migrated_tokens, ref calldata);
+    Serde::serialize(@shielded_pool_address, ref calldata);
     let new_factory = factory_hash
         .deploy_at(@calldata, 'new_factory'.try_into().unwrap())
         .expect('UnrugFactory deployment failed');
