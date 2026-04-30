@@ -4,7 +4,7 @@ use starknet::ContractAddress;
 use unruggable::exchanges::SupportedExchanges;
 use unruggable::exchanges::ekubo::launcher::EkuboLP;
 use unruggable::exchanges::ekubo_adapter::EkuboPoolParameters;
-use unruggable::factory::LaunchParameters;
+use unruggable::factory::{LaunchParameters, PrivateLaunchParameters};
 use unruggable::token::memecoin::LiquidityType;
 
 #[starknet::interface]
@@ -172,4 +172,50 @@ trait IFactory<TContractState> {
 
     /// Returns the address of Ekubo Core, registered inside the EkuboLauncher contract.
     fn ekubo_core_address(self: @TContractState) -> ContractAddress;
+
+    /// Returns the configured shielded pool address (zero if not set, in which case the
+    /// private launch paths revert).
+    fn shielded_pool_address(self: @TContractState) -> ContractAddress;
+
+    /// Like `launch_on_jediswap`, but the team allocation is deposited into the configured
+    /// STRK20 shielded pool as opaque notes.
+    ///
+    /// Requires:
+    /// * `shielded_pool_address` was set in the constructor.
+    /// * `launch_parameters.initial_holders` and `initial_holders_amounts` are empty
+    ///   (the private path uses `private_launch_parameters` as the single source of truth
+    ///   for team allocation).
+    /// * `private_launch_parameters.note_commitments`, `note_amounts`, and
+    ///   `encrypted_outputs` have the same length, are non-empty, and the count is at
+    ///   most `MAX_HOLDERS_LAUNCH`.
+    /// * The sum of `note_amounts` does not exceed the team-allocation cap (10% of supply).
+    /// * The memecoin is registered in the shielded pool.
+    fn launch_private_on_jediswap(
+        ref self: TContractState,
+        launch_parameters: LaunchParameters,
+        private_launch_parameters: PrivateLaunchParameters,
+        quote_amount: u256,
+        unlock_time: u64,
+    ) -> ContractAddress;
+
+    /// Like `launch_on_ekubo`, but the team allocation is deposited into the configured
+    /// STRK20 shielded pool as opaque notes. See `launch_private_on_jediswap` for the
+    /// shared preconditions.
+    fn launch_private_on_ekubo(
+        ref self: TContractState,
+        launch_parameters: LaunchParameters,
+        private_launch_parameters: PrivateLaunchParameters,
+        ekubo_parameters: EkuboPoolParameters,
+    ) -> (u64, EkuboLP);
+
+    /// Like `launch_on_starkdefi`, but the team allocation is deposited into the configured
+    /// STRK20 shielded pool as opaque notes. See `launch_private_on_jediswap` for the
+    /// shared preconditions.
+    fn launch_private_on_starkdefi(
+        ref self: TContractState,
+        launch_parameters: LaunchParameters,
+        private_launch_parameters: PrivateLaunchParameters,
+        quote_amount: u256,
+        unlock_time: u64,
+    ) -> ContractAddress;
 }

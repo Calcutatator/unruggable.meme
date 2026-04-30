@@ -25,7 +25,10 @@ mod Factory {
         jediswap_adapter::JediswapAdditionalParameters, ekubo::launcher::EkuboLP, starkdefi_adapter,
         starkdefi::interfaces::StarkDeFiAdditionalParameters
     };
-    use unruggable::factory::{IFactory, LaunchParameters};
+    use unruggable::factory::{IFactory, LaunchParameters, PrivateLaunchParameters};
+    use unruggable::privacy::interface::{
+        IShieldedPoolDispatcher, IShieldedPoolDispatcherTrait
+    };
     use unruggable::token::interface::{
         IUnruggableMemecoinDispatcher, IUnruggableMemecoinDispatcherTrait
     };
@@ -50,6 +53,7 @@ mod Factory {
     enum Event {
         MemecoinCreated: MemecoinCreated,
         MemecoinLaunched: MemecoinLaunched,
+        MemecoinPrivateTGE: MemecoinPrivateTGE,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -68,6 +72,17 @@ mod Factory {
         exchange_name: felt252,
     }
 
+    /// Emitted when a memecoin's team allocation is deposited as shielded notes during launch.
+    /// Deliberately omits per-recipient detail — that's the whole point of the private path.
+    #[derive(Drop, starknet::Event)]
+    struct MemecoinPrivateTGE {
+        memecoin_address: ContractAddress,
+        shielded_pool: ContractAddress,
+        num_notes: u32,
+        total_shielded: u256,
+        exchange_name: felt252,
+    }
+
 
     #[storage]
     struct Storage {
@@ -76,6 +91,7 @@ mod Factory {
         deployed_memecoins: LegacyMap<ContractAddress, bool>,
         lock_manager_address: ContractAddress,
         migrated_lock_managers: LegacyMap<ContractAddress, ContractAddress>,
+        shielded_pool_address: ContractAddress,
     }
 
     #[constructor]
@@ -85,9 +101,11 @@ mod Factory {
         lock_manager_address: ContractAddress,
         mut exchanges: Span<(SupportedExchanges, ContractAddress)>,
         mut migrated_tokens: Span<(ContractAddress, ContractAddress)>,
+        shielded_pool_address: ContractAddress,
     ) {
         self.memecoin_class_hash.write(memecoin_class_hash);
         self.lock_manager_address.write(lock_manager_address);
+        self.shielded_pool_address.write(shielded_pool_address);
 
         // Add Exchanges configurations
         loop {
@@ -312,6 +330,221 @@ mod Factory {
             pair_address
         }
 
+        fn shielded_pool_address(self: @ContractState) -> ContractAddress {
+            self.shielded_pool_address.read()
+        }
+
+        fn launch_private_on_jediswap(
+            ref self: ContractState,
+            launch_parameters: LaunchParameters,
+            private_launch_parameters: PrivateLaunchParameters,
+            quote_amount: u256,
+            unlock_time: u64,
+        ) -> ContractAddress {
+            let team_allocation = check_private_launch_parameters(
+                @self, launch_parameters, private_launch_parameters
+            );
+            let router_address = self.exchange_address(SupportedExchanges::Jediswap);
+            assert(router_address.is_non_zero(), errors::EXCHANGE_ADDRESS_ZERO);
+
+            let LaunchParameters{memecoin_address,
+            transfer_restriction_delay,
+            max_percentage_buy_launch,
+            quote_address,
+            initial_holders: _,
+            initial_holders_amounts: _ } =
+                launch_parameters;
+
+            let memecoin = IUnruggableMemecoinDispatcher { contract_address: memecoin_address };
+            let (pair_address, lock_position) =
+                jediswap_adapter::JediswapAdapterImpl::create_and_add_liquidity(
+                exchange_address: router_address,
+                token_address: memecoin_address,
+                quote_address: quote_address,
+                lp_supply: memecoin.total_supply() - team_allocation,
+                additional_parameters: JediswapAdditionalParameters {
+                    lock_manager_address: self.lock_manager_address.read(),
+                    unlock_time,
+                    quote_amount
+                }
+            );
+
+            deposit_team_to_pool(
+                @self, memecoin_address, team_allocation, private_launch_parameters
+            );
+
+            memecoin
+                .set_launched(
+                    LiquidityType::JediERC20(pair_address),
+                    LiquidityParameters::Jediswap(
+                        (JediswapLiquidityParameters { quote_address, quote_amount }, lock_position)
+                    ),
+                    :transfer_restriction_delay,
+                    :max_percentage_buy_launch,
+                    :team_allocation,
+                );
+
+            self
+                .emit(
+                    MemecoinLaunched {
+                        memecoin_address, quote_token: quote_address, exchange_name: 'Jediswap'
+                    }
+                );
+            self
+                .emit(
+                    MemecoinPrivateTGE {
+                        memecoin_address,
+                        shielded_pool: self.shielded_pool_address.read(),
+                        num_notes: private_launch_parameters.note_commitments.len(),
+                        total_shielded: team_allocation,
+                        exchange_name: 'Jediswap',
+                    }
+                );
+            pair_address
+        }
+
+        fn launch_private_on_ekubo(
+            ref self: ContractState,
+            launch_parameters: LaunchParameters,
+            private_launch_parameters: PrivateLaunchParameters,
+            ekubo_parameters: EkuboPoolParameters,
+        ) -> (u64, EkuboLP) {
+            let team_allocation = check_private_launch_parameters(
+                @self, launch_parameters, private_launch_parameters
+            );
+
+            assert(ekubo_parameters.fee <= 0x51eb851eb851ec00000000000000000, errors::FEE_TOO_HIGH);
+            assert(ekubo_parameters.tick_spacing >= 5982, errors::TICK_SPACING_TOO_LOW);
+            assert(ekubo_parameters.tick_spacing <= 19802, errors::TICK_SPACING_TOO_HIGH);
+            assert(ekubo_parameters.bound >= 88712960, errors::BOUND_TOO_LOW);
+
+            let LaunchParameters{memecoin_address,
+            transfer_restriction_delay,
+            max_percentage_buy_launch,
+            quote_address,
+            initial_holders: _,
+            initial_holders_amounts: _ } =
+                launch_parameters;
+
+            let launchpad_address = self.exchange_address(SupportedExchanges::Ekubo);
+            assert(launchpad_address.is_non_zero(), errors::EXCHANGE_ADDRESS_ZERO);
+            assert(ekubo_parameters.starting_price.mag.is_non_zero(), errors::PRICE_ZERO);
+
+            let memecoin = IUnruggableMemecoinDispatcher { contract_address: memecoin_address };
+            let (id, position) = ekubo_adapter::EkuboAdapterImpl::create_and_add_liquidity(
+                exchange_address: launchpad_address,
+                token_address: memecoin_address,
+                quote_address: quote_address,
+                lp_supply: memecoin.total_supply() - team_allocation,
+                additional_parameters: ekubo_parameters
+            );
+
+            deposit_team_to_pool(
+                @self, memecoin_address, team_allocation, private_launch_parameters
+            );
+
+            memecoin
+                .set_launched(
+                    LiquidityType::EkuboNFT(id),
+                    LiquidityParameters::Ekubo(
+                        EkuboLiquidityParameters {
+                            quote_address, ekubo_pool_parameters: ekubo_parameters
+                        }
+                    ),
+                    :transfer_restriction_delay,
+                    :max_percentage_buy_launch,
+                    :team_allocation,
+                );
+            self
+                .emit(
+                    MemecoinLaunched {
+                        memecoin_address, quote_token: quote_address, exchange_name: 'Ekubo'
+                    }
+                );
+            self
+                .emit(
+                    MemecoinPrivateTGE {
+                        memecoin_address,
+                        shielded_pool: self.shielded_pool_address.read(),
+                        num_notes: private_launch_parameters.note_commitments.len(),
+                        total_shielded: team_allocation,
+                        exchange_name: 'Ekubo',
+                    }
+                );
+            (id, position)
+        }
+
+        fn launch_private_on_starkdefi(
+            ref self: ContractState,
+            launch_parameters: LaunchParameters,
+            private_launch_parameters: PrivateLaunchParameters,
+            quote_amount: u256,
+            unlock_time: u64,
+        ) -> ContractAddress {
+            let team_allocation = check_private_launch_parameters(
+                @self, launch_parameters, private_launch_parameters
+            );
+            let router_address = self.exchange_address(SupportedExchanges::Starkdefi);
+            assert(router_address.is_non_zero(), errors::EXCHANGE_ADDRESS_ZERO);
+
+            let LaunchParameters{memecoin_address,
+            transfer_restriction_delay,
+            max_percentage_buy_launch,
+            quote_address,
+            initial_holders: _,
+            initial_holders_amounts: _ } =
+                launch_parameters;
+
+            let memecoin = IUnruggableMemecoinDispatcher { contract_address: memecoin_address };
+            let (pair_address, lock_position) =
+                starkdefi_adapter::StarkDeFiAdapterImpl::create_and_add_liquidity(
+                exchange_address: router_address,
+                token_address: memecoin_address,
+                quote_address: quote_address,
+                lp_supply: memecoin.total_supply() - team_allocation,
+                additional_parameters: StarkDeFiAdditionalParameters {
+                    lock_manager_address: self.lock_manager_address.read(),
+                    unlock_time,
+                    quote_amount
+                }
+            );
+
+            deposit_team_to_pool(
+                @self, memecoin_address, team_allocation, private_launch_parameters
+            );
+
+            memecoin
+                .set_launched(
+                    LiquidityType::StarkDeFiERC20(pair_address),
+                    LiquidityParameters::StarkDeFi(
+                        (
+                            StarkDeFiLiquidityParameters { quote_address, quote_amount },
+                            lock_position
+                        )
+                    ),
+                    :transfer_restriction_delay,
+                    :max_percentage_buy_launch,
+                    :team_allocation,
+                );
+            self
+                .emit(
+                    MemecoinLaunched {
+                        memecoin_address, quote_token: quote_address, exchange_name: 'StarkDeFi'
+                    }
+                );
+            self
+                .emit(
+                    MemecoinPrivateTGE {
+                        memecoin_address,
+                        shielded_pool: self.shielded_pool_address.read(),
+                        num_notes: private_launch_parameters.note_commitments.len(),
+                        total_shielded: team_allocation,
+                        exchange_name: 'StarkDeFi',
+                    }
+                );
+            pair_address
+        }
+
         fn locked_liquidity(
             self: @ContractState, token: ContractAddress
         ) -> Option<(ContractAddress, LiquidityType)> {
@@ -455,5 +688,103 @@ mod Factory {
                 Option::None => { break; }
             }
         }
+    }
+
+    /// Validates a private TGE launch and returns the team allocation. Mirrors
+    /// `check_common_launch_parameters` for everything that's still relevant on the private
+    /// path, then enforces the private-path invariants:
+    /// * Public `initial_holders` / `initial_holders_amounts` must be empty (the private
+    ///   path uses note commitments as the single source of truth for team allocation).
+    /// * Note arrays must be same-length, non-empty, and within `MAX_HOLDERS_LAUNCH`.
+    /// * The shielded pool address must be configured.
+    /// * The memecoin must be registered in the shielded pool.
+    /// * The sum of note amounts must not exceed the team-allocation cap (10%).
+    fn check_private_launch_parameters(
+        self: @ContractState,
+        launch_parameters: LaunchParameters,
+        private_launch_parameters: PrivateLaunchParameters,
+    ) -> u256 {
+        let memecoin_address = launch_parameters.memecoin_address;
+        let memecoin = IUnruggableMemecoinDispatcher { contract_address: memecoin_address };
+
+        assert(self.is_memecoin(memecoin_address), errors::NOT_UNRUGGABLE);
+        assert(
+            !self.is_memecoin(launch_parameters.quote_address), errors::QUOTE_TOKEN_IS_MEMECOIN
+        );
+        assert(!memecoin.is_launched(), errors::ALREADY_LAUNCHED);
+        assert(get_caller_address() == memecoin.owner(), errors::CALLER_NOT_OWNER);
+
+        // Single source of truth: refuse public holders on the private path.
+        assert(
+            launch_parameters.initial_holders.len() == 0, errors::PRIVATE_HOLDERS_NOT_EMPTY
+        );
+        assert(
+            launch_parameters.initial_holders_amounts.len() == 0,
+            errors::PRIVATE_HOLDERS_NOT_EMPTY
+        );
+
+        // Note-array shape.
+        let num_notes = private_launch_parameters.note_commitments.len();
+        assert(
+            num_notes == private_launch_parameters.note_amounts.len(),
+            errors::PRIVATE_ARRAYS_LEN_DIF
+        );
+        assert(
+            num_notes == private_launch_parameters.encrypted_outputs.len(),
+            errors::PRIVATE_ARRAYS_LEN_DIF
+        );
+        assert(num_notes != 0, errors::NO_NOTES_PROVIDED);
+        assert(num_notes <= MAX_HOLDERS_LAUNCH.into(), errors::MAX_HOLDERS_REACHED);
+
+        // Shielded pool must be set and recognise this memecoin.
+        let pool_address = self.shielded_pool_address.read();
+        assert(pool_address.is_non_zero(), errors::SHIELDED_POOL_NOT_SET);
+        let pool = IShieldedPoolDispatcher { contract_address: pool_address };
+        assert(pool.is_token_registered(memecoin_address), errors::TOKEN_NOT_REGISTERED_IN_POOL);
+
+        // Sum amounts and enforce team-allocation cap.
+        let initial_supply = memecoin.total_supply();
+        let max_team_allocation = initial_supply
+            .percent_mul(MAX_SUPPLY_PERCENTAGE_TEAM_ALLOCATION.into());
+        let mut team_allocation: u256 = 0;
+        let mut amounts = private_launch_parameters.note_amounts;
+        loop {
+            match amounts.pop_front() {
+                Option::Some(amount) => {
+                    team_allocation += *amount;
+                    assert(
+                        team_allocation <= max_team_allocation,
+                        errors::MAX_TEAM_ALLOCATION_REACHED
+                    );
+                },
+                Option::None => { break; }
+            }
+        };
+
+        team_allocation
+    }
+
+    /// Approves the shielded pool to pull `team_allocation` of `memecoin_address` from this
+    /// factory, then calls `pool.deposit(...)`. Caller is the factory contract; the memecoin
+    /// permits sender == factory transfers without applying transfer restrictions.
+    fn deposit_team_to_pool(
+        self: @ContractState,
+        memecoin_address: ContractAddress,
+        team_allocation: u256,
+        private_launch_parameters: PrivateLaunchParameters,
+    ) {
+        let pool_address = self.shielded_pool_address.read();
+        let memecoin = ERC20ABIDispatcher { contract_address: memecoin_address };
+        memecoin.approve(pool_address, team_allocation);
+
+        let pool = IShieldedPoolDispatcher { contract_address: pool_address };
+        pool
+            .deposit(
+                memecoin_address,
+                team_allocation,
+                private_launch_parameters.note_commitments,
+                private_launch_parameters.note_amounts,
+                private_launch_parameters.encrypted_outputs,
+            );
     }
 }

@@ -16,3 +16,10 @@ const TICK_SPACING_TOO_LOW: felt252 = 'Tick spacing low';
 const TICK_SPACING_TOO_HIGH: felt252 = 'Tick spacing high';
 const FEE_TOO_HIGH: felt252 = 'Fee too high';
 const BOUND_TOO_LOW: felt252 = 'Upper bound too low';
+
+// Private TGE
+const SHIELDED_POOL_NOT_SET: felt252 = 'Shielded pool not configured';
+const PRIVATE_HOLDERS_NOT_EMPTY: felt252 = 'Public holders must be empty';
+const PRIVATE_ARRAYS_LEN_DIF: felt252 = 'Private arrays length differ';
+const TOKEN_NOT_REGISTERED_IN_POOL: felt252 = 'Token not registered in pool';
+const NO_NOTES_PROVIDED: felt252 = 'No notes provided';
