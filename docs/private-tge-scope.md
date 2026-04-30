@@ -176,7 +176,7 @@ packages/contracts/src/
 
 ## Test plan
 
-**Result: 40 new unit tests added, all passing. Baseline 78 unit tests still passing — no regressions.**
+**Result: 40 new unit tests added, all passing. Baseline 78 unit tests still passing — no regressions. A devnet-based E2E walkthrough script also passes end-to-end (see [`docs/private-tge-e2e.md`](private-tge-e2e.md)).**
 
 The 18 pre-existing fork-test failures are unrelated: the repo's pinned `Scarb.toml` points at `https://rpc.nethermind.io/mainnet-juno/` which Nethermind has sunset, so the fork tests cannot reach a live RPC. This affects the `unruggable::tests::fork_tests::*` suite both before and after this PR.
 
