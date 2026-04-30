@@ -2,6 +2,7 @@ mod errors;
 mod exchanges;
 mod factory;
 mod locker;
+mod privacy;
 #[cfg(test)]
 mod tests;
 
@@ -11,6 +12,7 @@ mod utils;
 
 mod mocks {
     mod erc20;
+    mod shielded_pool;
     mod jediswap {
         mod factory;
         mod pair;
